@@ -88,8 +88,138 @@ _STOP_WORDS = frozenset(
         "also",
         "still",
         "even",
+        "about",
+        "into",
+        "over",
+        "under",
+        "up",
+        "out",
+        "off",
+        "how",
+        "what",
+        "when",
+        "where",
+        "who",
+        "why",
+        "which",
+        "want",
+        "wants",
+        "using",
+        "uses",
+        "use",
+        "like",
+        "have",
+        "has",
+        "had",
+        "get",
+        "gets",
+        "make",
+        "makes",
+        "tell",
+        "tells",
+        "talking",
+        "talk",
+        "create",
+        "creates",
+        "explore",
+        "explores",
     }
 )
+_EDGE_STOP_WORDS = _STOP_WORDS | frozenset(
+    {
+        "your",
+        "our",
+        "their",
+        "its",
+        "his",
+        "her",
+        "my",
+        "we",
+        "you",
+        "they",
+        "them",
+        "those",
+        "these",
+        "some",
+        "any",
+        "all",
+        "one",
+        "two",
+        "three",
+        "first",
+        "last",
+        "next",
+        "then",
+        "than",
+        "so",
+        "if",
+        "but",
+        "not",
+        "no",
+        "yes",
+        "via",
+        "per",
+        "vs",
+        "s",
+        "re",
+        "ve",
+        "ll",
+        "d",
+        "m",
+        "t",
+        "here",
+        "there",
+        "free",
+        "for",
+        "building",
+        "build",
+        "built",
+        "hope",
+        "see",
+        "full",
+        "most",
+        "more",
+        "less",
+        "best",
+        "ever",
+    }
+)
+_FRAGMENT_VERBS = frozenset(
+    {
+        "explore",
+        "explores",
+        "building",
+        "build",
+        "uses",
+        "use",
+        "using",
+        "want",
+        "wants",
+        "hope",
+        "hopes",
+        "see",
+        "tell",
+        "talk",
+        "talking",
+        "create",
+        "creates",
+        "like",
+        "get",
+        "gets",
+        "make",
+        "makes",
+        "had",
+        "has",
+        "have",
+        "was",
+        "were",
+        "been",
+        "got",
+        "did",
+        "ever",
+    }
+)
+_CONTRACTION_TOKENS = frozenset({"ve", "re", "ll", "d", "m", "t", "s", "nt", "ive"})
 
 _URL_PATTERN = re.compile(
     r"(https?://\S+|www\.\S+|\b[a-z0-9-]+\.(com|org|net|io|ai|co)\b)",
@@ -219,16 +349,17 @@ class CompetitiveMiner:
             return []
 
         clean_post = self._clean_post_text(post)
-        span_candidates = self._candidate_pool(clean_post)
+        span_candidates = self._candidate_pool(clean_post, raw_post=post)
 
-        span_tags = self._finalize_tags(
-            self._select_span_only_tags(clean_post, span_candidates)
+        span_selected = self._select_span_only_tags(
+            clean_post, span_candidates, raw_post=post
         )
-        if span_tags:
+        span_tags = self._finalize_tags(span_selected)
+        if len(span_tags) >= self.n_tags:
             return span_tags[: self.n_tags]
 
         llm_tags: list[str] = []
-        if self._should_call_llm(clean_post, span_candidates) and self._has_api_key():
+        if self._has_api_key():
             llm_post = clean_post if len(clean_post) >= 20 else post
             try:
                 llm_tags = self._generate_with_llm(llm_post, span_candidates)
@@ -239,16 +370,51 @@ class CompetitiveMiner:
         selected = self._select_final_tags(pool, span_candidates)
         if not selected:
             selected = self._fallback_tags(llm_tags, span_candidates, self.n_tags)
-        return self._finalize_tags(selected)[: self.n_tags]
+        return self._ensure_n_tags(
+            self._finalize_tags(selected),
+            clean_post,
+            span_candidates,
+        )[: self.n_tags]
+
+    def _ensure_n_tags(
+        self,
+        tags: list[str],
+        clean_post: str,
+        span_candidates: list[str],
+    ) -> list[str]:
+        out = list(tags)
+        if len(out) >= self.n_tags:
+            return out
+        ranked = self._rerank_for_consensus(
+            [tag for tag in span_candidates if not self._is_low_value_tag(tag)],
+            span_candidates,
+        )
+        out = self._fill_from_spans(out, ranked, self.n_tags)
+        if len(out) >= self.n_tags:
+            return out
+        for tag in self._token_ngram_candidates(clean_post):
+            if len(out) >= self.n_tags:
+                break
+            if tag in out or not self._is_valid_format(tag):
+                continue
+            if not self._is_coherent_tag(tag):
+                continue
+            if out and not self._is_diverse_enough(tag, out):
+                continue
+            out.append(tag)
+        return out
 
     def _finalize_tags(self, tags: list[str]) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
         for raw in tags:
             tag = smart_tag(raw)
+            tag = self._trim_tag_edges(tag)
             if not tag or tag in seen:
                 continue
             if not self._is_valid_format(tag):
+                continue
+            if not self._is_coherent_tag(tag):
                 continue
             out.append(tag)
             seen.add(tag)
@@ -258,12 +424,14 @@ class CompetitiveMiner:
         self,
         clean_post: str,
         span_candidates: list[str],
+        *,
+        raw_post: str = "",
     ) -> list[str]:
         """Skip the LLM when strong entity-like spans cover the post."""
         strong = [
             tag
             for tag in span_candidates
-            if self._is_strong_candidate(tag, clean_post)
+            if self._is_strong_candidate(tag, clean_post, raw_post=raw_post)
         ]
         if len(strong) < self.n_tags:
             return []
@@ -278,27 +446,36 @@ class CompetitiveMiner:
         return selected
 
     def _should_call_llm(self, clean_post: str, span_candidates: list[str]) -> bool:
+        coherent = [tag for tag in span_candidates if self._is_coherent_tag(tag)]
         if len(clean_post) <= SHORT_POST_CHAR_LIMIT:
-            return len(span_candidates) < self.n_tags
+            return len(coherent) < self.n_tags
         strong = sum(
-            1 for tag in span_candidates if self._is_strong_candidate(tag, clean_post)
+            1 for tag in coherent if self._is_strong_candidate(tag, clean_post)
         )
         if strong >= self.n_tags + 1:
             return False
         return True
 
-    def _is_strong_candidate(self, tag: str, post: str) -> bool:
+    def _is_strong_candidate(self, tag: str, post: str, *, raw_post: str = "") -> bool:
         if self._is_low_value_tag(tag) or not self._is_valid_format(tag):
+            return False
+        if not self._is_coherent_tag(tag):
             return False
         if len(tag.split()) >= 2:
             return True
-        if re.search(rf"@\s*{re.escape(tag)}\b", post, re.IGNORECASE):
+        source = f"{post}\n{raw_post}"
+        if re.search(rf"@\s*{re.escape(tag)}\b", source, re.IGNORECASE):
             return True
-        if re.search(rf"#\s*{re.escape(tag)}\b", post, re.IGNORECASE):
+        if re.search(rf"#\s*{re.escape(tag)}\b", source, re.IGNORECASE):
             return True
-        for match in re.finditer(r"\b[A-Z][A-Za-z0-9+\-]{1,}\b", post):
+        compact = re.sub(r"[\s_\-]+", "", tag.lower())
+        if re.search(rf"#\s*{re.escape(compact)}\b", source, re.IGNORECASE):
+            return True
+        for match in re.finditer(r"\b[A-Z][A-Za-z0-9+\-]{1,}\b", source):
             if normalize_tag(match.group(0)) == tag:
                 return True
+        if len(tag) >= 5 and re.search(rf"\b{re.escape(tag)}\b", source, re.IGNORECASE):
+            return True
         return False
 
     def _select_final_tags(
@@ -407,6 +584,8 @@ class CompetitiveMiner:
                 continue
             if not self._is_valid_format(tag):
                 continue
+            if not self._is_coherent_tag(tag):
+                continue
             out.append(tag)
             seen.add(tag)
             if len(out) >= n:
@@ -417,16 +596,108 @@ class CompetitiveMiner:
     def _clean_post_text(post: str) -> str:
         text = _URL_IN_TEXT.sub(" ", post)
         text = _MENTION_PATTERN.sub(" ", text)
+        text = re.sub(r"[\n\r]+", ". ", text)
+        text = re.sub(r"[^\w\s\-+#]", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return text or post.strip()
 
-    def _candidate_pool(self, post: str) -> list[str]:
+    @staticmethod
+    def _trim_tag_edges(tag: str) -> str:
+        words = tag.split()
+        while words and words[0] in _EDGE_STOP_WORDS:
+            words.pop(0)
+        while words and words[-1] in _EDGE_STOP_WORDS:
+            words.pop()
+        return " ".join(words)
+
+    def _is_coherent_tag(self, tag: str) -> bool:
+        """Reject sentence fragments, mention tails, and HTML/punctuation junk."""
+        if not tag:
+            return False
+        if "@" in tag or "," in tag or "=" in tag:
+            return False
+        if re.search(r"[()\[\]{}]", tag):
+            return False
+        if re.search(r"(^|\s)['\"]", tag) or tag.endswith((".", ":", "-", "'")):
+            return False
+        trimmed = self._trim_tag_edges(tag)
+        if not trimmed or trimmed != tag:
+            return False
+        tokens = trimmed.split()
+        if not tokens:
+            return False
+        if tokens[0] in _EDGE_STOP_WORDS or tokens[-1] in _EDGE_STOP_WORDS:
+            return False
+        if tokens[0] in _FRAGMENT_VERBS:
+            return False
+        if any(token in _CONTRACTION_TOKENS for token in tokens):
+            return False
+        if len(tokens) >= 3 and any(token in _EDGE_STOP_WORDS for token in tokens[1:-1]):
+            return False
+        if len(tokens) >= 2 and sum(1 for token in tokens if token in _FRAGMENT_VERBS) >= 2:
+            return False
+        if len(tokens) >= 3 and tokens[0] in _FRAGMENT_VERBS:
+            return False
+        if len(tokens) == 1 and len(tokens[0]) <= 2 and tokens[0] not in {"ai", "ml", "llm", "etf", "xrp", "btc", "xai"}:
+            return False
+        # Broken possessive / contraction fragments from cleaned punctuation.
+        if tokens[-1] in {"s", "re", "ve", "ll", "d", "m", "t"}:
+            return False
+        if len(tokens) >= 2 and tokens[-2] in {"world", "meta", "your", "our"} and tokens[-1] == "s":
+            return False
+        if any(tokens[i] == tokens[i + 1] for i in range(len(tokens) - 1)):
+            return False
+        if any(re.fullmatch(r"h[1-6]", token) for token in tokens):
+            return False
+        if len(tokens) >= 2 and any(
+            len(token) == 1 and token not in {"x"} for token in tokens
+        ):
+            return False
+        return True
+
+    @staticmethod
+    def _expand_span_chunks(span: str) -> list[str]:
+        words = span.split()
+        if len(words) <= 5:
+            return [span]
+        # Avoid sliding windows — they create junk like "kids about" / "uses gray".
+        chunks = [" ".join(words[: min(3, len(words))])]
+        if len(words) > 3:
+            tail = " ".join(words[-3:])
+            if tail != chunks[0]:
+                chunks.append(tail)
+        if words[0] not in _STOP_WORDS:
+            chunks.append(words[0])
+        return list(dict.fromkeys(chunks))
+
+    def _token_ngram_candidates(self, post: str) -> list[str]:
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", post.lower())
+            if token not in _STOP_WORDS and token not in _JUNK_TOKENS
+        ]
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for size in (1, 2):
+            for index in range(0, max(0, len(tokens) - size + 1)):
+                phrase = " ".join(tokens[index : index + size])
+                tag = smart_tag(phrase)
+                if not tag or tag in seen or not self._is_valid_format(tag):
+                    continue
+                seen.add(tag)
+                candidates.append(tag)
+        return self._sort_candidate_tags(candidates)
+
+    def _candidate_pool(self, post: str, *, raw_post: str = "") -> list[str]:
         candidates: list[str] = []
         seen: set[str] = set()
 
         def add(raw: str) -> None:
             tag = smart_tag(raw)
+            tag = self._trim_tag_edges(tag)
             if not tag or tag in seen or not self._is_valid_format(tag):
+                return
+            if not self._is_coherent_tag(tag):
                 return
             words = tag.split()
             if words[0] in _STOP_WORDS or words[-1] in _STOP_WORDS:
@@ -434,21 +705,31 @@ class CompetitiveMiner:
             seen.add(tag)
             candidates.append(tag)
 
-        for span in build_spans(post):
-            words = span.split()
-            if 1 <= len(words) <= 5:
-                add(span)
+        span_sources = [post]
+        if raw_post and raw_post != post:
+            span_sources.append(raw_post)
 
-        for match in re.finditer(r"\b[A-Z][A-Za-z0-9+\-]{1,}\b", post):
-            add(match.group(0))
+        for source in span_sources:
+            for span in build_spans(source):
+                for chunk in self._expand_span_chunks(span):
+                    words = chunk.split()
+                    if 1 <= len(words) <= 5:
+                        add(chunk)
 
-        for match in re.finditer(r"#([A-Za-z][A-Za-z0-9_]{1,})", post):
-            add(match.group(1))
+            for match in re.finditer(r"\b[A-Z][A-Za-z0-9+\-]{1,}\b", source):
+                add(match.group(0))
 
-        for match in re.finditer(r"@([A-Za-z][A-Za-z0-9_]{1,})", post):
-            add(match.group(1))
+            for match in re.finditer(r"#([A-Za-z][A-Za-z0-9_]{1,})", source):
+                add(match.group(1))
 
-        # Skip blind n-grams — they produce URL/t.co junk like "co qdosgfm5tw" and "https t".
+            for match in re.finditer(r"@([A-Za-z][A-Za-z0-9_]{1,})", source):
+                add(match.group(1))
+
+        if len(candidates) < self.n_tags:
+            for tag in self._token_ngram_candidates(post):
+                if tag not in seen:
+                    seen.add(tag)
+                    candidates.append(tag)
 
         return self._sort_candidate_tags(candidates)
 
@@ -683,6 +964,8 @@ class CompetitiveMiner:
         if re.fullmatch(r"[\d\s.,:/%+\-]+", normalized):
             return False
         if re.fullmatch(r"[^\w\s]+", normalized, flags=re.UNICODE):
+            return False
+        if not self._is_coherent_tag(normalized):
             return False
         compact = [ch for ch in normalized if not ch.isspace()]
         if not compact:
