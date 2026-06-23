@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
@@ -37,6 +38,17 @@ except ImportError:  # pragma: no cover - used when this file is executed direct
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PM2_MONITOR_SUFFIX = "auto-update"
+PM2_HEALTHY_STATUSES = frozenset({"online", "launching"})
+DEFAULT_PM2_RESILIENCE_ARGS = (
+    "--restart-delay",
+    "5000",
+    "--max-restarts",
+    "999999",
+    "--exp-backoff-restart-delay",
+    "1000",
+    "--kill-timeout",
+    "15000",
+)
 ROLE_MODULES = {
     "validator": "tag101.validator",
     "miner": "tag101.miner",
@@ -246,12 +258,19 @@ def build_start_command(
         "--interpreter",
         "none",
         "--time",
-        *split_env_args(env.get("PM2_START_ARGS", "")),
+        *pm2_resilience_args(env),
         "--",
         "-m",
         ROLE_MODULES[role],
         *process_args,
     ]
+
+
+def pm2_resilience_args(env: Mapping[str, str]) -> list[str]:
+    custom = split_env_args(env.get("PM2_START_ARGS", ""))
+    if custom:
+        return custom
+    return list(DEFAULT_PM2_RESILIENCE_ARGS)
 
 
 def auto_process_args(env: Mapping[str, str], cwd: Path) -> list[str]:
@@ -308,6 +327,7 @@ def auto_update_commands(
 def monitor_commands_from_args(args: argparse.Namespace, env_files: Sequence[Path]) -> list[PlannedCommand]:
     selected_python = node_python(args.python, env_files)
     process_command = monitor_process_command(args, env_files, selected_python)
+    env = load_env_files(env_files)
     command = [
         "pm2",
         "start",
@@ -319,10 +339,10 @@ def monitor_commands_from_args(args: argparse.Namespace, env_files: Sequence[Pat
         "--interpreter",
         "none",
         "--time",
+        *pm2_resilience_args(env),
         "--",
         *process_command[1:],
     ]
-    env = load_env_files(env_files)
     return [PlannedCommand(command, env=env or None)]
 
 
@@ -367,6 +387,14 @@ def monitor_loop(args: argparse.Namespace) -> None:
     )
     while True:
         try:
+            ensure_process_running(
+                role=args.role,
+                name=args.name,
+                env_files=env_files,
+                python_bin=selected_python,
+                cli_args=cli_args,
+                save=not bool(args.no_save),
+            )
             commands = auto_update_commands(
                 upstream=str(args.auto_update_upstream),
                 fetch=not bool(args.auto_update_no_fetch),
@@ -406,6 +434,63 @@ def node_python(python_bin: str | None, env_files: Sequence[Path]) -> str:
 
 def monitor_name(name: str) -> str:
     return f"{name}-{PM2_MONITOR_SUFFIX}"
+
+
+def pm2_process_status(name: str) -> str | None:
+    result = subprocess.run(
+        ["pm2", "jlist"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        processes = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    for process in processes:
+        if process.get("name") != name:
+            continue
+        env = process.get("pm2_env") or {}
+        status = env.get("status")
+        return str(status) if status is not None else None
+    return None
+
+
+def ensure_process_running(
+    *,
+    role: str,
+    name: str,
+    env_files: Sequence[Path],
+    python_bin: str | None,
+    cli_args: Sequence[str] = (),
+    save: bool = True,
+) -> None:
+    status = pm2_process_status(name)
+    if status in PM2_HEALTHY_STATUSES:
+        return
+    print(
+        f"pm2_health_monitor name={name} status={status or 'missing'} action=restart",
+        flush=True,
+    )
+    env = load_env_files(env_files)
+    commands = [
+        *stop_commands(name),
+        PlannedCommand(
+            build_start_command(
+                role=role,
+                name=name,
+                env_files=env_files,
+                python_bin=python_bin,
+                cli_args=cli_args,
+                cwd=REPO_ROOT,
+            ),
+            env=env or None,
+        ),
+        *save_commands(enabled=save),
+    ]
+    run_planned_commands(commands, dry_run=False, cwd=REPO_ROOT)
 
 
 def stop_commands(name: str) -> list[PlannedCommand]:

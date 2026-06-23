@@ -76,21 +76,53 @@ def _add_miner_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--blacklist.force_validator_permit", action="store_true", default=False)
     parser.add_argument("--miner.allow_empty_hotkey", action="store_true", default=False)
     parser.add_argument(
+        "--miner.axon_to_public_metagraph",
+        action="store_true",
+        default=_env_bool("MINER_AXON_TO_PUBLIC_METAGRAPH", False),
+        help="Use only the public metagraph axon and skip task-server private axon announcements.",
+    )
+    parser.add_argument(
+        "--miner.hide_axon_from_metagraph",
+        action="store_true",
+        default=_env_bool("MINER_HIDE_AXON_FROM_METAGRAPH", False),
+        help=(
+            "Publish 0.0.0.0:<port> on the public metagraph while still announcing the real "
+            "axon endpoint to the Tag101 task server for validators."
+        ),
+    )
+    parser.add_argument(
+        "--miner.log_dir",
+        type=str,
+        default=os.getenv("MINER_LOG_DIR", ""),
+        help="Directory for validator-task and API-cost JSONL logs.",
+    )
+    parser.add_argument(
+        "--miner.enable_task_log",
+        dest="miner.enable_task_log",
+        type=_env_bool,
+        default=_env_bool("MINER_ENABLE_TASK_LOG", True),
+        help="Append validator task events to JSONL for offline replay.",
+    )
+    parser.add_argument(
+        "--miner.enable_cost_log",
+        dest="miner.enable_cost_log",
+        type=_env_bool,
+        default=_env_bool("MINER_ENABLE_COST_LOG", True),
+        help="Track OpenAI token usage and daily API cost.",
+    )
+    parser.add_argument(
         "--task.miner_module",
         type=str,
-        default=os.getenv("TASK_MINER_MODULE", ""),
+        default=os.getenv(
+            "TASK_MINER_MODULE",
+            os.getenv("MINER_TASK_MODULE", "tag101.tasks.competitive_sn101"),
+        ),
         help=(
             "Optional task handler module used by miners to override a default "
             "task solver."
         ),
     )
     _add_task_server_args(parser, default_url=DEFAULT_TASK_SERVER_URL)
-    parser.add_argument(
-        "--miner.axon_to_public_metagraph",
-        action="store_true",
-        default=_env_bool("MINER_AXON_TO_PUBLIC_METAGRAPH", False),
-        help="Use only the public metagraph axon and skip task-server private axon announcements.",
-    )
 
 
 def _add_validator_args(parser: argparse.ArgumentParser) -> None:

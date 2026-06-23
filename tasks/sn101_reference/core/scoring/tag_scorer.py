@@ -11,6 +11,24 @@ from .preprocessing import (
 )
 from .validity import ValidityScorer
 
+_MODEL_CACHE: dict[str, Any] = {}
+
+
+def get_embedding_model(model_name: str) -> Any:
+    """Load sentence-transformers once per model name (reuse across tasks)."""
+    cached = _MODEL_CACHE.get(model_name)
+    if cached is not None:
+        return cached
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:
+        raise ImportError(
+            "sentence-transformers is required. Install it with "
+            "'pip install sentence-transformers'."
+        ) from exc
+    _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+    return _MODEL_CACHE[model_name]
+
 
 class TagScorer:
     """Phase 1 scorer composed from independent tag scorers."""
@@ -104,14 +122,7 @@ class TagScorer:
         }
 
     def _load_model(self, model_name: str):
-        try:
-            from sentence_transformers import SentenceTransformer
-        except ImportError as exc:
-            raise ImportError(
-                "sentence-transformers is required. Install it with "
-                "'pip install sentence-transformers'."
-            ) from exc
-        return SentenceTransformer(model_name)
+        return get_embedding_model(model_name)
 
     def _flatten_scores(self, scores: list[list[float]]) -> list[float]:
         return [score for miner_scores in scores for score in miner_scores]

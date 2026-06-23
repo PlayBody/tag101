@@ -79,15 +79,31 @@ class ChainRuntime:
         axon_cls = bittensor_attr("axon", "Axon")
         return axon_cls(wallet=self.wallet, config=self.config)
 
-    def serve_axon(self, axon: Any) -> Any:
-        response = self.subtensor.serve_axon(
-            netuid=self.config.netuid,
-            axon=axon,
-            wait_for_inclusion=True,
-            wait_for_finalization=False,
-            wait_for_revealed_execution=False,
-            period=None,
-        )
+    def serve_axon(
+        self,
+        axon: Any,
+        *,
+        chain_ip: str | None = None,
+        chain_port: int | None = None,
+    ) -> Any:
+        published_ip = chain_ip if chain_ip is not None else axon.external_ip
+        published_port = chain_port if chain_port is not None else axon.external_port
+        original_ip = axon.external_ip
+        original_port = axon.external_port
+        axon.external_ip = published_ip
+        axon.external_port = published_port
+        try:
+            response = self.subtensor.serve_axon(
+                netuid=self.config.netuid,
+                axon=axon,
+                wait_for_inclusion=True,
+                wait_for_finalization=False,
+                wait_for_revealed_execution=False,
+                period=None,
+            )
+        finally:
+            axon.external_ip = original_ip
+            axon.external_port = original_port
         if not getattr(response, "success", False):
             raise RuntimeError(f"failed to serve axon: {getattr(response, 'message', response)}")
         return response

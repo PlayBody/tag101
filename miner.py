@@ -1,12 +1,14 @@
 """Bittensor miner entry point."""
 
 import asyncio
+import signal
 import time
 from typing import Any, Tuple
 
 from ._bt import require_bittensor
 from .chain.runtime import ChainRuntime
 from .chain.settings import build_config
+from .observability import configure_observability, log_validator_task, task_scope
 from .protocol import TaskEnvelope
 from .tasks import TaskRegistry, TaskServerClient, build_task_registry
 
@@ -25,20 +27,82 @@ class SolverMiner:
             priority_fn=self.priority,
         )
         self.should_exit = False
+        self._configure_observability()
+
+    def _configure_observability(self) -> None:
+        enable_task_log = bool(getattr(self.config.miner, "enable_task_log", True))
+        enable_cost_log = bool(getattr(self.config.miner, "enable_cost_log", True))
+        log_dir = str(getattr(self.config.miner, "log_dir", "") or "").strip()
+        if not log_dir:
+            log_dir = str(self.config.neuron.storage_dir)
+        configure_observability(
+            log_dir,
+            enable_task_log=enable_task_log,
+            enable_cost_log=enable_cost_log,
+        )
+        self.bt.logging.info(
+            f"miner observability log_dir={log_dir} "
+            f"task_log={enable_task_log} cost_log={enable_cost_log}"
+        )
 
     async def forward(self, synapse: TaskEnvelope) -> TaskEnvelope:
         started = time.perf_counter()
+        dendrite = getattr(synapse, "dendrite", None)
+        validator_hotkey = getattr(dendrite, "hotkey", None)
+        validator_uid = self._uid_for_hotkey(validator_hotkey)
+        tweet_id = str(dict(synapse.payload or {}).get("tweet_id", "") or "")
+        post_text = str(dict(synapse.payload or {}).get("text", "") or "")
+        success = True
+        error_text = ""
+        tags: list[str] = []
         try:
-            handler = self.registry.handler_for(synapse.task_kind)
-            synapse.answer = handler.solve_problem(synapse, self.runtime)
-        except Exception:
+            with task_scope(
+                task_id=str(synapse.task_id or ""),
+                task_kind=str(synapse.task_kind or ""),
+                validator_hotkey=validator_hotkey,
+                validator_uid=validator_uid,
+                netuid=int(self.config.netuid),
+                miner_uid=int(self.runtime.uid),
+                tweet_id=tweet_id,
+            ):
+                handler = self.registry.handler_for(synapse.task_kind)
+                synapse.answer = handler.solve_problem(synapse, self.runtime)
+            raw_tags = synapse.answer.get("tags") if isinstance(synapse.answer, dict) else None
+            if isinstance(raw_tags, list):
+                tags = [str(tag) for tag in raw_tags if isinstance(tag, str)]
+        except Exception as exc:
+            success = False
+            error_text = f"{type(exc).__name__}: {exc}"
             synapse.answer = {}
         elapsed = time.perf_counter() - started
         self.bt.logging.info(
             f"MINER_SOLVED_TASK task={synapse.task_id} kind={synapse.task_kind} "
-            f"elapsed={elapsed:.3f}s answer_keys={list(synapse.answer)}"
+            f"validator_uid={validator_uid} validator={str(validator_hotkey or '')[:16]} "
+            f"elapsed={elapsed:.3f}s tags={tags} answer_keys={list(synapse.answer)}"
+        )
+        log_validator_task(
+            task_id=str(synapse.task_id or ""),
+            task_kind=str(synapse.task_kind or ""),
+            validator_hotkey=validator_hotkey,
+            validator_uid=validator_uid,
+            netuid=int(self.config.netuid),
+            miner_uid=int(self.runtime.uid),
+            post_text=post_text,
+            tweet_id=tweet_id,
+            tags=tags,
+            elapsed_sec=elapsed,
+            success=success,
+            error=error_text or None,
         )
         return synapse
+
+    def _uid_for_hotkey(self, hotkey: str | None) -> int | None:
+        if not hotkey:
+            return None
+        hotkeys = list(getattr(self.runtime.metagraph, "hotkeys", []))
+        if hotkey not in hotkeys:
+            return None
+        return hotkeys.index(hotkey)
 
     async def blacklist(self, synapse: TaskEnvelope) -> Tuple[bool, str]:
         dendrite = getattr(synapse, "dendrite", None)
@@ -72,10 +136,27 @@ class SolverMiner:
 
     def run(self) -> None:
         self.runtime.ensure_registered()
-        self.runtime.serve_axon(self.axon)
+        hide_public_axon = bool(getattr(self.config.miner, "hide_axon_from_metagraph", False))
+        if hide_public_axon:
+            hidden_port = int(getattr(self.config.axon, "external_port", None) or self.axon.external_port or 8092)
+            self.runtime.serve_axon(self.axon, chain_ip="0.0.0.0", chain_port=hidden_port)
+            self.bt.logging.info(
+                f"miner published hidden metagraph axon 0.0.0.0:{hidden_port}; "
+                "real endpoint will be announced to the task server"
+            )
+        else:
+            self.runtime.serve_axon(self.axon)
         self.axon.start()
         self.bt.logging.info(f"miner serving at block {self.runtime.block}")
         self._announce_private_axon_at_startup()
+
+        def _request_shutdown(signum: int, _frame: Any) -> None:
+            self.bt.logging.info(f"miner shutdown requested (signal {signum})")
+            self.should_exit = True
+
+        signal.signal(signal.SIGTERM, _request_shutdown)
+        signal.signal(signal.SIGINT, _request_shutdown)
+
         try:
             while not self.should_exit:
                 self.runtime.sync_metagraph()

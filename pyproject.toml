@@ -25,6 +25,8 @@ dependencies = [
 [project.scripts]
 tag101-miner = "tag101.miner:main"
 tag101-validator = "tag101.validator:main"
+tag101-benchmark = "tag101.tools.benchmark_miner:main"
+tag101-register-check = "tag101.tools.register_decision:main"
 
 [tool.setuptools]
 packages = [
@@ -36,6 +38,8 @@ packages = [
   "tag101.tasks.sn101_reference",
   "tag101.tasks.sn101_reference.core",
   "tag101.tasks.sn101_reference.core.scoring",
+  "tag101.observability",
+  "tag101.tools",
 ]
 package-dir = { "tag101" = "." }
 

@@ -1,0 +1,19 @@
+{
+  "posts": [
+    {
+      "text": "OpenAI released a new reasoning model today. Developers on X are debating latency vs accuracy tradeoffs for agent workflows."
+    },
+    {
+      "text": "Anthropic updated Claude with better tool use. Enterprise teams are testing it for internal support bots and code review."
+    },
+    {
+      "text": "NVIDIA announced next-gen GPUs optimized for inference. AI startups expect lower serving costs for open-weight models."
+    },
+    {
+      "text": "The EU AI Act enforcement timeline is pushing US labs to rethink model deployment in Europe. Policy analysts expect compliance tooling demand."
+    },
+    {
+      "text": "A new open-source LLM benchmark shows smaller models closing the gap on math tasks. Hugging Face trending repos highlight efficient fine-tuning."
+    }
+  ]
+}

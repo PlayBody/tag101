@@ -1,59 +1,14 @@
-"""Task adapter for the SN101 reference implementation.
-
-The SN101 scoring/miner logic lives under ``tag101.tasks.sn101_reference``.
-This module intentionally stays thin: it converts the wire-format answer into
-the reference scorer input, and converts the reference scorer output into
-``ScoreBreakdown``. Task payloads are leased from the task server.
-"""
+"""Shared scoring helpers for SN101 task modules."""
 
 from __future__ import annotations
 
-import random
 import re
 from typing import Any, Mapping, Sequence
 
-from ..chain.runtime import ChainRuntime
-from ..protocol import TaskEnvelope
-from .framework import (
-    ScoreBreakdown,
-    TaskHandler,
-)
-from .sn101_reference.core.miner import (
-    Miner as ReferenceMiner,
-)
+from .framework import ScoreBreakdown
+from .sn101 import REFERENCE_MODEL_NAME, SN101_MAX_TAGS
 
-
-KIND = "sn101.tags.v1"
-SPEC_VERSION = "v1"
-REFERENCE_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 _SCORER_CACHE: dict[tuple[str, int, float], Any] = {}
-# SN101 constants are intentionally fixed here, not provided through
-# task_profile_json. Keep them in code so validators cannot change task shape.
-SN101_MAX_TAGS = 3
-SN101_TIME_LIMIT = 120.0
-SN101_TEST_FALLBACK_TAGS = (
-    "bitcoin",
-    "ethereum",
-    "crypto market",
-    "defi",
-    "stablecoin",
-    "regulation",
-    "etf",
-    "trading",
-)
-
-
-def solve_problem(envelope: TaskEnvelope, chain_runtime: ChainRuntime) -> dict[str, Any]:
-    task_payload = dict(envelope.payload)
-    post = str(task_payload.get("text", ""))
-    miner = ReferenceMiner(n_tags=SN101_MAX_TAGS, timeout_sec=int(SN101_TIME_LIMIT))
-    try:
-        tags = miner.generate_tags(post)
-    except RuntimeError as exc:
-        if "Set OPENAI_API_KEY" not in str(exc):
-            raise
-        tags = [random.choice(SN101_TEST_FALLBACK_TAGS)]
-    return {"tags": tags}
 
 
 def score_answers(
@@ -144,24 +99,7 @@ def _tags_from_answer(answer: Mapping[str, Any]) -> list[str]:
     for value in values:
         if not isinstance(value, str):
             continue
-        # Keep normalization inside the reference scorer. Importing its
-        # preprocessing module here would execute scoring/__init__.py and
-        # force miner startup to import sklearn even though miners do not score.
         tag = value
         if tag:
             tags.append(tag)
     return tags
-
-
-solve = solve_problem
-score_batch = score_answers
-
-
-def handler() -> TaskHandler:
-    return TaskHandler(
-        kind=KIND,
-        spec_version=SPEC_VERSION,
-        solve_problem=solve_problem,
-        score_answers=score_answers,
-        description="SN101 semantic tagging task backed by the reference scorer.",
-    )

@@ -24,6 +24,6 @@ AXON_EXTERNAL_IP=<MINER_AXON_EXTERNAL_IP>
 # Base miner args. Fill in endpoint and wallet values before starting. Extra CLI
 # args after "--" in docker_node.py are appended after this value and therefore
 # win if an option appears twice.
-NODE_ARGS=--netuid 101 --subtensor.network <SUBTENSOR_ENDPOINT> --wallet.name <WALLET_NAME> --wallet.hotkey <HOTKEY_NAME> --logging.info
+NODE_ARGS=--netuid 101 --subtensor.network <SUBTENSOR_ENDPOINT> --wallet.name <WALLET_NAME> --wallet.hotkey <HOTKEY_NAME> --logging.info --task.miner_module tag101.tasks.competitive_sn101
 # To override a task solver in the miner environment, append:
-#   --task.miner_module your_package.your_miner_module
+#   --task.miner_module tag101.tasks.competitive_sn101
