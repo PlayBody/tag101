@@ -332,7 +332,7 @@ class CompetitiveMiner:
 
     # Identifies the tag-generation strategy this build ships. Overridden on
     # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
-    STRATEGY = "b0-baseline-balanced"
+    STRATEGY = "b8-score-aware-consensus"
 
     def __init__(
         self,
@@ -349,6 +349,12 @@ class CompetitiveMiner:
         self.timeout_sec = timeout_sec
 
     def generate_tags(self, post: str) -> list[str]:
+        # b8 STRATEGY: score-aware selection + consensus ("Schelling") LLM prompt.
+        # Build a pool of extractive spans + LLM tags that asks for the tags MOST
+        # people would also pick, then choose the set that maximizes our LOCAL
+        # prediction of the validator score: exact validity + diversity via the
+        # same MiniLM model, plus a centroid-proximity consensus estimate, with
+        # mean-maximizing greedy selection (never dilute the mean).
         post = post.strip()
         if not post:
             return []
@@ -356,30 +362,174 @@ class CompetitiveMiner:
         clean_post = self._clean_post_text(post)
         span_candidates = self._candidate_pool(clean_post, raw_post=post)
 
-        span_selected = self._select_span_only_tags(
-            clean_post, span_candidates, raw_post=post
-        )
-        span_tags = self._finalize_tags(span_selected)
-        if len(span_tags) >= self.n_tags:
-            return span_tags[: self.n_tags]
-
         llm_tags: list[str] = []
         if self._has_api_key():
             llm_post = clean_post if len(clean_post) >= 20 else post
             try:
-                llm_tags = self._generate_with_llm(llm_post, span_candidates)
+                llm_tags = self._generate_with_llm_consensus(llm_post, span_candidates)
             except RuntimeError:
                 llm_tags = []
 
-        pool = self._merge_candidates(span_candidates, llm_tags)
-        selected = self._select_final_tags(pool, span_candidates)
+        selected = self._score_aware_select(
+            llm_tags, span_candidates, clean_post, post
+        )
         if not selected:
-            selected = self._fallback_tags(llm_tags, span_candidates, self.n_tags)
-        return self._ensure_n_tags(
-            self._finalize_tags(selected),
-            clean_post,
-            span_candidates,
-        )[: self.n_tags]
+            selected = self._ensure_n_tags(
+                self._finalize_tags(span_candidates), clean_post, span_candidates
+            )
+        return selected[: self.n_tags]
+
+    def _generate_with_llm_consensus(
+        self, post: str, span_candidates: list[str]
+    ) -> list[str]:
+        hints = ", ".join(span_candidates[:12]) if span_candidates else "(none)"
+        system_prompt = (
+            "You are a social-media tagging engine for a CONSENSUS game. Output "
+            "only the tags that the MOST independent taggers would also choose "
+            "for the post: the single obvious main topic, named entities, "
+            "products, people, and tickers. Prefer short canonical forms "
+            "(ai not artificial intelligence; btc not bitcoin price; meta not "
+            "meta platforms). No hashtags, no '#', no sentences, no reactions, "
+            "no commentary."
+        )
+        user_prompt = (
+            f"Post:\n{post}\n\n"
+            f"Candidate phrases from the post: {hints}\n\n"
+            f"Return a JSON array of the {self.n_tags} most widely-agreed tags, "
+            "lowercase, most-obvious first."
+        )
+        payload = {
+            "model": self.model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        content = self._call_chat_completions(payload)
+        return self._parse_tags(content)
+
+    def _score_aware_select(
+        self,
+        llm_tags: list[str],
+        extractive: list[str],
+        clean_post: str,
+        raw_post: str,
+    ) -> list[str]:
+        """LLM consensus tags are the primary answer (best predictor of an
+        LLM-based crowd). The local scorer (exact validity via MiniLM) is used
+        only to (1) drop ungrounded LLM hallucinations and (2) backfill with
+        grounded extractive tags, ranked by predicted score, never padding with
+        weak filler (mean-aware quality floor)."""
+        llm_tags = self._finalize_tags(llm_tags)
+        extractive = self._finalize_tags(
+            [tag for tag in extractive if not self._is_low_value_tag(tag)]
+        )
+        if not llm_tags and not extractive:
+            return []
+
+        spans = list(build_spans(clean_post)) or [clean_post]
+        model = self._get_embedder()
+        if model is None:
+            # No embeddings: trust LLM order, backfill via consensus rerank.
+            selected: list[str] = []
+            for tag in [*llm_tags, *self._rerank_for_consensus(extractive, extractive)]:
+                if len(selected) >= self.n_tags:
+                    break
+                if tag in selected or (selected and not self._is_diverse_enough(tag, selected)):
+                    continue
+                selected.append(tag)
+            return selected
+
+        import numpy as np
+
+        ordered = list(dict.fromkeys([*llm_tags, *extractive]))
+        post_vec = model.encode(
+            [clean_post], convert_to_numpy=True, normalize_embeddings=True
+        )[0]
+        span_vecs = model.encode(
+            spans, convert_to_numpy=True, normalize_embeddings=True
+        )
+        tag_vecs = model.encode(
+            ordered, convert_to_numpy=True, normalize_embeddings=True
+        )
+        if tag_vecs.ndim == 1:
+            tag_vecs = tag_vecs.reshape(1, -1)
+        index = {tag: i for i, tag in enumerate(ordered)}
+
+        span_token_set: set[str] = set()
+        for span in spans:
+            span_token_set |= self._tokenize(span)
+
+        def metrics(tag: str) -> tuple[float, float]:
+            i = index[tag]
+            sim_post = float(tag_vecs[i] @ post_vec)
+            sim_span = float(np.max(span_vecs @ tag_vecs[i])) if len(spans) else 0.0
+            validity = self._tier_validity(
+                max(
+                    self._scale_similarity(sim_post),
+                    self._scale_similarity(sim_span),
+                    self._lexical_overlap(tag, span_token_set),
+                )
+            )
+            return validity, sim_post
+
+        selected = []
+        # Priority 1: LLM consensus tags. Keep them even at modest validity
+        # (the crowd is LLM-based, so they carry consensus); drop only pure
+        # hallucinations -- validity 0 AND no semantic grounding to the post.
+        for tag in llm_tags:
+            if len(selected) >= self.n_tags:
+                break
+            if selected and not self._is_diverse_enough(tag, selected):
+                continue
+            validity, sim_post = metrics(tag)
+            if validity == 0.0 and sim_post < 0.20:
+                continue
+            selected.append(tag)
+
+        # Priority 2: backfill with grounded extractive tags by predicted score,
+        # above an absolute quality floor (grounded tags score >= 0.4).
+        if len(selected) < self.n_tags:
+            ranked = sorted(
+                (tag for tag in extractive if tag not in selected),
+                key=lambda tag: -(0.6 * max(metrics(tag)[1], 0.0) + 0.4 * metrics(tag)[0]),
+            )
+            for tag in ranked:
+                if len(selected) >= self.n_tags:
+                    break
+                if selected and not self._is_diverse_enough(tag, selected):
+                    continue
+                validity, sim_post = metrics(tag)
+                predicted = 0.6 * max(sim_post, 0.0) + 0.4 * validity
+                if selected and predicted < 0.20:
+                    break
+                selected.append(tag)
+        return selected
+
+    @staticmethod
+    def _scale_similarity(sim: float, low: float = 0.30, high: float = 0.75) -> float:
+        if sim <= low:
+            return 0.0
+        if sim >= high:
+            return 1.0
+        return (sim - low) / (high - low)
+
+    @staticmethod
+    def _tier_validity(raw: float) -> float:
+        if raw < 0.15:
+            return 0.0
+        if raw < 0.35:
+            return 0.3
+        if raw < 0.65:
+            return 0.6
+        return 1.0
+
+    def _lexical_overlap(self, tag: str, span_token_set: set[str]) -> float:
+        tokens = self._tokenize(tag)
+        if not tokens:
+            return 0.0
+        return sum(1 for token in tokens if token in span_token_set) / len(tokens)
 
     def _ensure_n_tags(
         self,
