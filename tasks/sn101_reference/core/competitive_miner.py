@@ -379,7 +379,15 @@ class CompetitiveMiner:
         clean_post: str,
         span_candidates: list[str],
     ) -> list[str]:
-        out = list(tags)
+        # Drop duplicated/contained word segments first ("rolling everyone" +
+        # "everyone" + "rolling" -> keep only "rolling everyone"). The embedding
+        # centroid gate can miss these on short tags, so enforce it here where
+        # every strategy funnels through before returning.
+        out: list[str] = []
+        for tag in tags:
+            if out and not self._is_diverse_enough(tag, out):
+                continue
+            out.append(tag)
         if len(out) >= self.n_tags:
             return out
         ranked = self._rerank_for_consensus(
@@ -415,6 +423,8 @@ class CompetitiveMiner:
                 continue
             if self._is_junk_tag(cand) or self._is_low_value_tag(cand):
                 continue
+            if out and not self._is_diverse_enough(cand, out):
+                continue
             out.append(cand)
         return out
 
@@ -429,6 +439,8 @@ class CompetitiveMiner:
             if not self._is_valid_format(tag):
                 continue
             if not self._is_coherent_tag(tag):
+                continue
+            if out and not self._is_diverse_enough(tag, out):
                 continue
             out.append(tag)
             seen.add(tag)
@@ -938,8 +950,21 @@ class CompetitiveMiner:
         return out
 
     def _is_diverse_enough(self, tag: str, selected: list[str]) -> bool:
-        """Mirror diversity scorer thresholds using token Jaccard as a fast proxy."""
+        """Mirror the validator diversity scorer using token overlap as a fast
+        proxy. The scorer penalizes near-duplicate tags by embedding similarity
+        (>=0.55 loses points, >=0.85 scores 0), so we reject two cases that
+        embeddings see as duplicates:
+          1. token containment -- one tag's words fully inside another
+             ("good" vs "good day", "game changer" vs "absolute game changer",
+             "iran" vs "attacked iran");
+          2. heavy token overlap (Jaccard >= threshold)."""
+        tag_tokens = self._tokenize(tag)
         for other in selected:
+            other_tokens = self._tokenize(other)
+            if tag_tokens and other_tokens and (
+                tag_tokens <= other_tokens or other_tokens <= tag_tokens
+            ):
+                return False
             if self._token_jaccard(tag, other) >= DIVERSITY_SIMILARITY_THRESHOLD:
                 return False
         return True
