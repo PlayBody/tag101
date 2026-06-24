@@ -1,9 +1,18 @@
 """Bittensor miner entry point."""
 
 import asyncio
+import json
+import re
 import signal
 import time
 from typing import Any, Tuple
+
+
+def _post_log_preview(text: str, limit: int = 200) -> str:
+    collapsed = re.sub(r"\s+", " ", (text or "").strip())
+    if len(collapsed) > limit:
+        return collapsed[:limit] + "…"
+    return collapsed
 
 from ._bt import require_bittensor
 from .chain.runtime import ChainRuntime
@@ -75,10 +84,12 @@ class SolverMiner:
             error_text = f"{type(exc).__name__}: {exc}"
             synapse.answer = {}
         elapsed = time.perf_counter() - started
+        post_preview = json.dumps(_post_log_preview(post_text))
         self.bt.logging.info(
             f"MINER_SOLVED_TASK task={synapse.task_id} kind={synapse.task_kind} "
             f"validator_uid={validator_uid} validator={str(validator_hotkey or '')[:16]} "
-            f"elapsed={elapsed:.3f}s tags={tags} answer_keys={list(synapse.answer)}"
+            f"elapsed={elapsed:.3f}s post_preview={post_preview} tags={tags} "
+            f"answer_keys={list(synapse.answer)}"
         )
         log_validator_task(
             task_id=str(synapse.task_id or ""),
