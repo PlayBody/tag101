@@ -11,3 +11,4 @@ htmlcov/
 .deploy-state/
 node-state/
 *.env
+.axon-worktrees/
