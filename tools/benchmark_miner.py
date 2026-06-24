@@ -212,6 +212,14 @@ def replay_logged_tasks(
         return 1
 
     improved_wins = 0
+    _agg: dict[str, float] = {
+        "n": 0,
+        "logged_score": 0.0, "improved_score": 0.0,
+        "logged_consensus": 0.0, "improved_consensus": 0.0,
+        "logged_validity": 0.0, "improved_validity": 0.0,
+        "logged_diversity": 0.0, "improved_diversity": 0.0,
+        "logged_ntags": 0.0, "improved_ntags": 0.0,
+    }
     for index, event in enumerate(events, start=1):
         post = str(event.get("post_text", "")).strip()
         if not post:
@@ -240,13 +248,44 @@ def replay_logged_tasks(
         if improve and len(rows) >= 2:
             improved = next((row for row in rows if row["label"] == "improved"), None)
             logged = next((row for row in rows if row["label"] == "logged"), None)
-            if improved and logged and improved["score"] > logged["score"]:
-                improved_wins += 1
+            if improved and logged:
+                if improved["score"] > logged["score"]:
+                    improved_wins += 1
+                _agg["n"] += 1
+                for key in ("score",):
+                    _agg["logged_" + key] += float(logged.get(key, 0.0) or 0.0)
+                    _agg["improved_" + key] += float(improved.get(key, 0.0) or 0.0)
+                for comp in ("consensus", "validity", "diversity"):
+                    lv = logged.get(comp) or []
+                    iv = improved.get(comp) or []
+                    _agg["logged_" + comp] += (sum(lv) / len(lv)) if lv else 0.0
+                    _agg["improved_" + comp] += (sum(iv) / len(iv)) if iv else 0.0
+                _agg["logged_ntags"] += len(logged.get("tags") or [])
+                _agg["improved_ntags"] += len(improved.get("tags") or [])
 
     if improve:
         print(
             f"\nReplay summary: improved beat logged on "
             f"{improved_wins}/{len(events)} events."
+        )
+        n = max(1, _agg["n"])
+        def _avg(key: str) -> float:
+            return _agg[key] / n
+        print(f"\nAggregate over {_agg['n']} scored events (avg):")
+        print(
+            f"  score      logged={_avg('logged_score'):.4f}  "
+            f"improved={_avg('improved_score'):.4f}  "
+            f"delta={_avg('improved_score') - _avg('logged_score'):+.4f}"
+        )
+        for comp in ("consensus", "validity", "diversity"):
+            print(
+                f"  {comp:<10} logged={_avg('logged_' + comp):.4f}  "
+                f"improved={_avg('improved_' + comp):.4f}  "
+                f"delta={_avg('improved_' + comp) - _avg('logged_' + comp):+.4f}"
+            )
+        print(
+            f"  avg #tags  logged={_avg('logged_ntags'):.2f}  "
+            f"improved={_avg('improved_ntags'):.2f}"
         )
     return 0
 

@@ -35,6 +35,7 @@ build_spans = _PREPROCESSING.build_spans
 normalize_tag = _PREPROCESSING.normalize_tag
 
 from .tag_wordmap import smart_tag
+from .tag_wordmap import _EXPLICIT_MAP as _BRAND_MAP
 
 OPENAI_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -329,6 +330,10 @@ Return a JSON array of exactly {n_tags} tags.
 class CompetitiveMiner:
     """Scoring-aware miner. Drop-in replacement for ReferenceMiner."""
 
+    # Identifies the tag-generation strategy this build ships. Overridden on
+    # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
+    STRATEGY = "b0-baseline-balanced"
+
     def __init__(
         self,
         api_key: str = OPENAI_KEY,
@@ -402,6 +407,23 @@ class CompetitiveMiner:
             if out and not self._is_diverse_enough(tag, out):
                 continue
             out.append(tag)
+        if len(out) >= self.n_tags:
+            return out
+        # Last resort: never ship fewer than n_tags. Missing tags score 0 on BOTH
+        # validity and diversity, so a plausible single word beats an empty slot.
+        # Diversity gating is dropped here (only deduped) since this only fires on
+        # short/sparse posts where we already exhausted the ranked pools.
+        for token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", clean_post.lower()):
+            if len(out) >= self.n_tags:
+                break
+            if len(token) < 3 or token in _STOP_WORDS or token in _JUNK_TOKENS:
+                continue
+            cand = self._trim_tag_edges(smart_tag(token))
+            if not cand or cand in out:
+                continue
+            if self._is_junk_tag(cand) or self._is_low_value_tag(cand):
+                continue
+            out.append(cand)
         return out
 
     def _finalize_tags(self, tags: list[str]) -> list[str]:
@@ -469,6 +491,8 @@ class CompetitiveMiner:
         if re.search(rf"#\s*{re.escape(tag)}\b", source, re.IGNORECASE):
             return True
         compact = re.sub(r"[\s_\-]+", "", tag.lower())
+        if compact in _BRAND_MAP:
+            return True
         if re.search(rf"#\s*{re.escape(compact)}\b", source, re.IGNORECASE):
             return True
         for match in re.finditer(r"\b[A-Z][A-Za-z0-9+\-]{1,}\b", source):
@@ -1012,6 +1036,17 @@ class CompetitiveMiner:
                 return True
             # t.co slugs and opaque handle fragments (e.g. qdosgfm5tw, gvrurodf0e)
             if len(token) >= 6 and re.fullmatch(r"[a-z0-9]+", token):
+                has_alpha = any(ch.isalpha() for ch in token)
+                has_digit = any(ch.isdigit() for ch in token)
                 if sum(ch in "aeiou" for ch in token) == 0:
                     return True
+                # letter+digit slug where a digit is followed by a letter, e.g.
+                # o98n0hfax8 / od6x3iytti / kgnkbb3nmu (real brands like gpt4,
+                # claude3 keep digits trailing and are not flagged).
+                if has_alpha and has_digit and re.search(r"\d[a-z]", token):
+                    return True
+            # opaque consonant-only handle fragments (e.g. pmqqrhhiek); 6+ run is
+            # far beyond any real English word (max ~5).
+            if len(token) >= 7 and re.search(r"[bcdfghjklmnpqrstvwxz]{6,}", token):
+                return True
         return False
