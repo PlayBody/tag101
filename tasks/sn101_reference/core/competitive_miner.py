@@ -332,7 +332,7 @@ class CompetitiveMiner:
 
     # Identifies the tag-generation strategy this build ships. Overridden on
     # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
-    STRATEGY = "b0-baseline-balanced"
+    STRATEGY = "b7-current-baseline"
 
     def __init__(
         self,
