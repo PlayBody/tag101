@@ -332,7 +332,7 @@ class CompetitiveMiner:
 
     # Identifies the tag-generation strategy this build ships. Overridden on
     # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
-    STRATEGY = "b0-baseline-balanced"
+    STRATEGY = "b1-simplest-extractive"
 
     def __init__(
         self,
@@ -349,36 +349,39 @@ class CompetitiveMiner:
         self.timeout_sec = timeout_sec
 
     def generate_tags(self, post: str) -> list[str]:
+        # b1 STRATEGY: simplest possible. Pure extractive -- take post-grounded
+        # span/entity candidates, order by first appearance (earliest mention =
+        # most salient), and pick the first 3 mutually-diverse ones. No LLM, no
+        # embeddings: fully deterministic, ~zero cost, maximal grounding.
         post = post.strip()
         if not post:
             return []
 
         clean_post = self._clean_post_text(post)
-        span_candidates = self._candidate_pool(clean_post, raw_post=post)
+        candidates = self._candidate_pool(clean_post, raw_post=post)
+        lowered = clean_post.lower()
 
-        span_selected = self._select_span_only_tags(
-            clean_post, span_candidates, raw_post=post
+        def position(tag: str) -> int:
+            idx = lowered.find(tag.split()[0])
+            return idx if idx >= 0 else 1_000_000
+
+        ordered = sorted(
+            candidates,
+            key=lambda tag: (position(tag), abs(len(tag.split()) - 2), tag),
         )
-        span_tags = self._finalize_tags(span_selected)
-        if len(span_tags) >= self.n_tags:
-            return span_tags[: self.n_tags]
 
-        llm_tags: list[str] = []
-        if self._has_api_key():
-            llm_post = clean_post if len(clean_post) >= 20 else post
-            try:
-                llm_tags = self._generate_with_llm(llm_post, span_candidates)
-            except RuntimeError:
-                llm_tags = []
+        selected: list[str] = []
+        for tag in ordered:
+            if len(selected) >= self.n_tags:
+                break
+            if self._is_low_value_tag(tag):
+                continue
+            if selected and not self._is_diverse_enough(tag, selected):
+                continue
+            selected.append(tag)
 
-        pool = self._merge_candidates(span_candidates, llm_tags)
-        selected = self._select_final_tags(pool, span_candidates)
-        if not selected:
-            selected = self._fallback_tags(llm_tags, span_candidates, self.n_tags)
         return self._ensure_n_tags(
-            self._finalize_tags(selected),
-            clean_post,
-            span_candidates,
+            self._finalize_tags(selected), clean_post, candidates
         )[: self.n_tags]
 
     def _ensure_n_tags(
