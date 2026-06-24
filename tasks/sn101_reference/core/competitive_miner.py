@@ -332,7 +332,7 @@ class CompetitiveMiner:
 
     # Identifies the tag-generation strategy this build ships. Overridden on
     # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
-    STRATEGY = "b0-baseline-balanced"
+    STRATEGY = "b4-topic-salience"
 
     def __init__(
         self,
@@ -349,37 +349,52 @@ class CompetitiveMiner:
         self.timeout_sec = timeout_sec
 
     def generate_tags(self, post: str) -> list[str]:
+        # b4 STRATEGY: topic salience -- "what is important in the topic".
+        # Rank candidates by a salience score that rewards early mention, entity
+        # signals (capitalized/#/@/brand), repeated mention, and a ~2-word
+        # topical shape, while penalizing generic filler. Picks the most
+        # topically-central terms rather than just the first or the average.
         post = post.strip()
         if not post:
             return []
 
         clean_post = self._clean_post_text(post)
-        span_candidates = self._candidate_pool(clean_post, raw_post=post)
-
-        span_selected = self._select_span_only_tags(
-            clean_post, span_candidates, raw_post=post
+        candidates = self._candidate_pool(clean_post, raw_post=post)
+        ordered = sorted(
+            candidates,
+            key=lambda tag: (-self._salience_score(tag, clean_post, post), tag),
         )
-        span_tags = self._finalize_tags(span_selected)
-        if len(span_tags) >= self.n_tags:
-            return span_tags[: self.n_tags]
 
-        llm_tags: list[str] = []
-        if self._has_api_key():
-            llm_post = clean_post if len(clean_post) >= 20 else post
-            try:
-                llm_tags = self._generate_with_llm(llm_post, span_candidates)
-            except RuntimeError:
-                llm_tags = []
+        selected: list[str] = []
+        for tag in ordered:
+            if len(selected) >= self.n_tags:
+                break
+            if self._is_low_value_tag(tag):
+                continue
+            if selected and not self._is_diverse_enough(tag, selected):
+                continue
+            selected.append(tag)
 
-        pool = self._merge_candidates(span_candidates, llm_tags)
-        selected = self._select_final_tags(pool, span_candidates)
-        if not selected:
-            selected = self._fallback_tags(llm_tags, span_candidates, self.n_tags)
         return self._ensure_n_tags(
-            self._finalize_tags(selected),
-            clean_post,
-            span_candidates,
+            self._finalize_tags(selected), clean_post, candidates
         )[: self.n_tags]
+
+    def _salience_score(self, tag: str, clean_post: str, raw_post: str) -> float:
+        words = tag.split()
+        if not words:
+            return -10.0
+        lowered = f"{clean_post}\n{raw_post}".lower()
+        score = 0.0
+        idx = lowered.find(words[0])
+        if idx >= 0:
+            score += max(0.0, 1.0 - idx / max(len(lowered), 1)) * 2.0
+        if self._is_strong_candidate(tag, clean_post, raw_post=raw_post):
+            score += 1.5
+        score += {1: 0.4, 2: 1.0, 3: 0.7}.get(len(words), 0.2)
+        score += min(max(lowered.count(words[0]) - 1, 0), 3) * 0.3
+        if self._is_low_value_tag(tag):
+            score -= 2.0
+        return score
 
     def _ensure_n_tags(
         self,
