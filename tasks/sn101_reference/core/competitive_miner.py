@@ -415,25 +415,11 @@ class CompetitiveMiner:
             if out and not self._is_diverse_enough(tag, out):
                 continue
             out.append(tag)
-        if len(out) >= self.n_tags:
-            return out
-        # Last resort: never ship fewer than n_tags. Missing tags score 0 on BOTH
-        # validity and diversity, so a plausible single word beats an empty slot.
-        # Diversity gating is dropped here (only deduped) since this only fires on
-        # short/sparse posts where we already exhausted the ranked pools.
-        for token in re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)?", clean_post.lower()):
-            if len(out) >= self.n_tags:
-                break
-            if len(token) < 3 or token in _STOP_WORDS or token in _JUNK_TOKENS:
-                continue
-            cand = self._trim_tag_edges(smart_tag(token))
-            if not cand or cand in out:
-                continue
-            if self._is_junk_tag(cand) or self._is_low_value_tag(cand):
-                continue
-            if out and not self._is_diverse_enough(cand, out):
-                continue
-            out.append(cand)
+        # Quality over quantity: the validator scores the MEAN of the tags we
+        # submit (aggregate_miner_score averages only the present tags, with no
+        # penalty for fewer than n). Padding with low-value filler would drag
+        # that mean down, so we stop here and return the grounded, coherent tags
+        # we have -- even if that is only 1-2 on a sparse/near-empty post.
         return out
 
     def _finalize_tags(self, tags: list[str]) -> list[str]:
