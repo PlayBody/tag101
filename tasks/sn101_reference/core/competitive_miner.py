@@ -332,7 +332,7 @@ class CompetitiveMiner:
 
     # Identifies the tag-generation strategy this build ships. Overridden on
     # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
-    STRATEGY = "b0-baseline-balanced"
+    STRATEGY = "b6-ensemble-complex"
 
     def __init__(
         self,
@@ -349,19 +349,17 @@ class CompetitiveMiner:
         self.timeout_sec = timeout_sec
 
     def generate_tags(self, post: str) -> list[str]:
+        # b6 STRATEGY: most complex / ensemble. Gather span + LLM candidates,
+        # then rank them by a Borda blend of three independent signals -- validity
+        # (grounding), consensus (span/centroid alignment), and topic salience --
+        # and take the 3 best diverse tags. Combines every lever at once so no
+        # single weak signal dominates.
         post = post.strip()
         if not post:
             return []
 
         clean_post = self._clean_post_text(post)
         span_candidates = self._candidate_pool(clean_post, raw_post=post)
-
-        span_selected = self._select_span_only_tags(
-            clean_post, span_candidates, raw_post=post
-        )
-        span_tags = self._finalize_tags(span_selected)
-        if len(span_tags) >= self.n_tags:
-            return span_tags[: self.n_tags]
 
         llm_tags: list[str] = []
         if self._has_api_key():
@@ -371,15 +369,115 @@ class CompetitiveMiner:
             except RuntimeError:
                 llm_tags = []
 
-        pool = self._merge_candidates(span_candidates, llm_tags)
-        selected = self._select_final_tags(pool, span_candidates)
-        if not selected:
-            selected = self._fallback_tags(llm_tags, span_candidates, self.n_tags)
+        pool = [
+            tag
+            for tag in self._merge_candidates(span_candidates, llm_tags)
+            if not self._is_low_value_tag(tag)
+        ]
+        selected = self._ensemble_select(pool, clean_post, post, span_candidates)
         return self._ensure_n_tags(
-            self._finalize_tags(selected),
-            clean_post,
-            span_candidates,
+            self._finalize_tags(selected), clean_post, span_candidates
         )[: self.n_tags]
+
+    def _ensemble_select(
+        self,
+        pool: list[str],
+        clean_post: str,
+        raw_post: str,
+        span_candidates: list[str],
+    ) -> list[str]:
+        if not pool:
+            return []
+        validity_rank = self._rank_by_validity(pool, clean_post)
+        consensus_rank = self._rerank_for_consensus(pool, span_candidates)
+        salience_rank = sorted(
+            pool,
+            key=lambda tag: (-self._salience_score(tag, clean_post, raw_post), tag),
+        )
+        points: dict[str, float] = {tag: 0.0 for tag in pool}
+        for ranking, weight in (
+            (validity_rank, 1.0),
+            (consensus_rank, 1.2),
+            (salience_rank, 1.0),
+        ):
+            size = len(ranking)
+            for rank, tag in enumerate(ranking):
+                if tag in points:
+                    points[tag] += weight * (size - rank)
+
+        ordered = sorted(pool, key=lambda tag: (-points[tag], tag))
+        selected: list[str] = []
+        for tag in ordered:
+            if len(selected) >= self.n_tags:
+                break
+            if selected and not self._is_diverse_enough(tag, selected):
+                continue
+            selected.append(tag)
+        return selected
+
+    def _salience_score(self, tag: str, clean_post: str, raw_post: str) -> float:
+        words = tag.split()
+        if not words:
+            return -10.0
+        lowered = f"{clean_post}\n{raw_post}".lower()
+        score = 0.0
+        idx = lowered.find(words[0])
+        if idx >= 0:
+            score += max(0.0, 1.0 - idx / max(len(lowered), 1)) * 2.0
+        if self._is_strong_candidate(tag, clean_post, raw_post=raw_post):
+            score += 1.5
+        score += {1: 0.4, 2: 1.0, 3: 0.7}.get(len(words), 0.2)
+        score += min(max(lowered.count(words[0]) - 1, 0), 3) * 0.3
+        if self._is_low_value_tag(tag):
+            score -= 2.0
+        return score
+
+    def _rank_by_validity(self, candidates: list[str], clean_post: str) -> list[str]:
+        if not candidates:
+            return []
+        spans = list(build_spans(clean_post)) or [clean_post]
+        span_token_set: set[str] = set()
+        for span in spans:
+            span_token_set |= self._tokenize(span)
+
+        model = self._get_embedder()
+        if model is None:
+            return sorted(
+                candidates,
+                key=lambda tag: (-self._lexical_overlap(tag, span_token_set), tag),
+            )
+
+        import numpy as np
+
+        post_vec = model.encode(
+            [clean_post], convert_to_numpy=True, normalize_embeddings=True
+        )[0]
+        span_vecs = model.encode(
+            spans, convert_to_numpy=True, normalize_embeddings=True
+        )
+        tag_vecs = model.encode(
+            candidates, convert_to_numpy=True, normalize_embeddings=True
+        )
+        if tag_vecs.ndim == 1:
+            tag_vecs = tag_vecs.reshape(1, -1)
+
+        def validity(idx: int, tag: str) -> float:
+            sim_post = float(tag_vecs[idx] @ post_vec)
+            sim_span = float(np.max(span_vecs @ tag_vecs[idx]))
+            lexical = self._lexical_overlap(tag, span_token_set)
+            return max(sim_post, sim_span, lexical)
+
+        order = sorted(
+            range(len(candidates)),
+            key=lambda idx: (-validity(idx, candidates[idx]), candidates[idx]),
+        )
+        return [candidates[idx] for idx in order]
+
+    def _lexical_overlap(self, tag: str, span_token_set: set[str]) -> float:
+        tokens = self._tokenize(tag)
+        if not tokens:
+            return 0.0
+        return sum(1 for token in tokens if token in span_token_set) / len(tokens)
 
     def _ensure_n_tags(
         self,
