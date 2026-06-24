@@ -332,7 +332,7 @@ class CompetitiveMiner:
 
     # Identifies the tag-generation strategy this build ships. Overridden on
     # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
-    STRATEGY = "b0-baseline-balanced"
+    STRATEGY = "b5-validity-max"
 
     def __init__(
         self,
@@ -349,37 +349,81 @@ class CompetitiveMiner:
         self.timeout_sec = timeout_sec
 
     def generate_tags(self, post: str) -> list[str]:
+        # b5 STRATEGY: validity maximizer. Rank candidates by the SAME grounding
+        # signal the validator validity scorer uses -- max(sim(tag, post),
+        # sim(tag, span), lexical overlap) -- and take the 3 best diverse ones.
+        # Locks the deterministic 40% (validity x diversity) as hard as possible;
+        # grounded canonical terms also tend to be popular (consensus).
         post = post.strip()
         if not post:
             return []
 
         clean_post = self._clean_post_text(post)
-        span_candidates = self._candidate_pool(clean_post, raw_post=post)
+        candidates = [
+            tag
+            for tag in self._candidate_pool(clean_post, raw_post=post)
+            if not self._is_low_value_tag(tag)
+        ]
+        ranked = self._rank_by_validity(candidates, clean_post)
 
-        span_selected = self._select_span_only_tags(
-            clean_post, span_candidates, raw_post=post
-        )
-        span_tags = self._finalize_tags(span_selected)
-        if len(span_tags) >= self.n_tags:
-            return span_tags[: self.n_tags]
+        selected: list[str] = []
+        for tag in ranked:
+            if len(selected) >= self.n_tags:
+                break
+            if selected and not self._is_diverse_enough(tag, selected):
+                continue
+            selected.append(tag)
 
-        llm_tags: list[str] = []
-        if self._has_api_key():
-            llm_post = clean_post if len(clean_post) >= 20 else post
-            try:
-                llm_tags = self._generate_with_llm(llm_post, span_candidates)
-            except RuntimeError:
-                llm_tags = []
-
-        pool = self._merge_candidates(span_candidates, llm_tags)
-        selected = self._select_final_tags(pool, span_candidates)
-        if not selected:
-            selected = self._fallback_tags(llm_tags, span_candidates, self.n_tags)
         return self._ensure_n_tags(
-            self._finalize_tags(selected),
-            clean_post,
-            span_candidates,
+            self._finalize_tags(selected), clean_post, candidates
         )[: self.n_tags]
+
+    def _rank_by_validity(self, candidates: list[str], clean_post: str) -> list[str]:
+        if not candidates:
+            return []
+        spans = list(build_spans(clean_post)) or [clean_post]
+        span_token_set: set[str] = set()
+        for span in spans:
+            span_token_set |= self._tokenize(span)
+
+        model = self._get_embedder()
+        if model is None:
+            return sorted(
+                candidates,
+                key=lambda tag: (-self._lexical_overlap(tag, span_token_set), tag),
+            )
+
+        import numpy as np
+
+        post_vec = model.encode(
+            [clean_post], convert_to_numpy=True, normalize_embeddings=True
+        )[0]
+        span_vecs = model.encode(
+            spans, convert_to_numpy=True, normalize_embeddings=True
+        )
+        tag_vecs = model.encode(
+            candidates, convert_to_numpy=True, normalize_embeddings=True
+        )
+        if tag_vecs.ndim == 1:
+            tag_vecs = tag_vecs.reshape(1, -1)
+
+        def validity(idx: int, tag: str) -> float:
+            sim_post = float(tag_vecs[idx] @ post_vec)
+            sim_span = float(np.max(span_vecs @ tag_vecs[idx]))
+            lexical = self._lexical_overlap(tag, span_token_set)
+            return max(sim_post, sim_span, lexical)
+
+        order = sorted(
+            range(len(candidates)),
+            key=lambda idx: (-validity(idx, candidates[idx]), candidates[idx]),
+        )
+        return [candidates[idx] for idx in order]
+
+    def _lexical_overlap(self, tag: str, span_token_set: set[str]) -> float:
+        tokens = self._tokenize(tag)
+        if not tokens:
+            return 0.0
+        return sum(1 for token in tokens if token in span_token_set) / len(tokens)
 
     def _ensure_n_tags(
         self,
