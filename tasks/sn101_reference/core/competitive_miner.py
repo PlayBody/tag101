@@ -982,14 +982,21 @@ class CompetitiveMiner:
              "iran" vs "attacked iran");
           2. heavy token overlap (Jaccard >= threshold)."""
         tag_tokens = self._tokenize(tag)
+        if not tag_tokens:
+            return True
         for other in selected:
             other_tokens = self._tokenize(other)
-            if tag_tokens and other_tokens and (
-                tag_tokens <= other_tokens or other_tokens <= tag_tokens
-            ):
-                return False
-            if self._token_jaccard(tag, other) >= DIVERSITY_SIMILARITY_THRESHOLD:
-                return False
+            if not other_tokens:
+                continue
+            shared = len(tag_tokens & other_tokens)
+            if shared:
+                # Reject when the shared words are >=50% of the shorter tag.
+                # Subsumes containment ("good" vs "good day") and breaks chains
+                # that repeat a word ("good day" / "day super" share "day").
+                if shared / min(len(tag_tokens), len(other_tokens)) >= 0.5:
+                    return False
+                if self._token_jaccard(tag, other) >= DIVERSITY_SIMILARITY_THRESHOLD:
+                    return False
         return True
 
     @staticmethod
