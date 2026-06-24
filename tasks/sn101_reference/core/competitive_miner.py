@@ -332,7 +332,7 @@ class CompetitiveMiner:
 
     # Identifies the tag-generation strategy this build ships. Overridden on
     # each experiment branch (b1..b6) so deployed UIDs are self-identifying.
-    STRATEGY = "b0-baseline-balanced"
+    STRATEGY = "b3-llm-abstractive"
 
     def __init__(
         self,
@@ -349,37 +349,28 @@ class CompetitiveMiner:
         self.timeout_sec = timeout_sec
 
     def generate_tags(self, post: str) -> list[str]:
+        # b3 STRATEGY: LLM-first / abstractive -- "what a person would tag it".
+        # Always ask the LLM (when a key is configured) and trust its topical,
+        # human-like tags; only backfill from post spans when it under-delivers.
+        # Tests the hypothesis that a strong model predicts the human crowd
+        # better than mechanical extraction. Falls back to spans with no key.
         post = post.strip()
         if not post:
             return []
 
         clean_post = self._clean_post_text(post)
-        span_candidates = self._candidate_pool(clean_post, raw_post=post)
-
-        span_selected = self._select_span_only_tags(
-            clean_post, span_candidates, raw_post=post
-        )
-        span_tags = self._finalize_tags(span_selected)
-        if len(span_tags) >= self.n_tags:
-            return span_tags[: self.n_tags]
+        candidates = self._candidate_pool(clean_post, raw_post=post)
 
         llm_tags: list[str] = []
         if self._has_api_key():
             llm_post = clean_post if len(clean_post) >= 20 else post
             try:
-                llm_tags = self._generate_with_llm(llm_post, span_candidates)
+                llm_tags = self._generate_with_llm(llm_post, candidates)
             except RuntimeError:
                 llm_tags = []
 
-        pool = self._merge_candidates(span_candidates, llm_tags)
-        selected = self._select_final_tags(pool, span_candidates)
-        if not selected:
-            selected = self._fallback_tags(llm_tags, span_candidates, self.n_tags)
-        return self._ensure_n_tags(
-            self._finalize_tags(selected),
-            clean_post,
-            span_candidates,
-        )[: self.n_tags]
+        selected = self._finalize_tags(llm_tags)
+        return self._ensure_n_tags(selected, clean_post, candidates)[: self.n_tags]
 
     def _ensure_n_tags(
         self,
